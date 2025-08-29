@@ -48,7 +48,7 @@ void setup() {
 void loop() {
   // put your main code here, to run repeatedly:
   float theta_goal = map(analogRead(slide_trimmer), 0, 1023, -3000, 3000) / 100.0;
-  float theta_trimmer = map(analogRead(slide_trimmer), 384, 615, -300, 300) / 10.0;
+  float theta_trimmer = map(analogRead(axle_trimmer), 384, 615, -300, 300) / 10.0;
   Serial.println(theta_trimmer);
 }
 
@@ -77,9 +77,12 @@ void motor_setup() {
   move_right(125);
   while(digitalRead(right_limit));
   stop();
-  float theta_trimmer = map(analogRead(slide_trimmer), 384, 615, -300, 300) / 10.0;
+  float theta_trimmer = map(analogRead(axle_trimmer), 384, 615, -300, 300) / 10.0;
   move_left(125);
-  while(theta_trimmer > 0);
+  while(theta_trimmer > 0) {
+    theta_trimmer = map(analogRead(axle_trimmer), 384, 615, -300, 300) / 10.0;
+    Serial.println(theta_trimmer);
+  }
   stop();
 
 }
