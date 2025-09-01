@@ -45,16 +45,6 @@ void loop() {
   float gx = (rawGyro[0] - gyroOffsets[0]) / GYRO_SCALE;
   float gy = (rawGyro[1] - gyroOffsets[1]) / GYRO_SCALE;
   float gz = (rawGyro[2] - gyroOffsets[2]) / GYRO_SCALE;
-
-  // Serial.print("Accel (g): X=");
-  // Serial.print(ax, 3); Serial.print(" Y=");
-  // Serial.print(ay, 3); Serial.print(" Z=");
-  // Serial.print(az, 3);
-
-  // Serial.print(" | Gyro (°/s): X=");
-  // Serial.print(gx, 3); Serial.print(" Y=");
-  // Serial.print(gy, 3); Serial.print(" Z=");
-  // Serial.println(gz, 3);
   
   // Calculates pitch angle
   float theta = atan(ay/az)*180/M_PI;
