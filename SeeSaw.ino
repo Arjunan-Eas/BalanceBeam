@@ -40,7 +40,7 @@ double gyroOffsets[6]  = {0,0,0,0,0,0};
 
 /* Min/Max constants */
 const int MAX_PWM = 255;
-const int MIN_PWN = 80;
+const int MIN_PWM = 100;
 double MAX_ANGLE = 0.0;
 double MIN_ANGLE = 0.0;
 int MAX_POT = 0;
@@ -53,6 +53,15 @@ double theta_kalman;
 unsigned long loop_start;
 int16_t acc[3] = {0, 0, 0};
 int16_t gyro[3] = {0, 0, 0};
+
+/* PID */
+float Kp = 0.2;
+float Kd = 0.8;
+float Ki = 0.0;
+double theta_goal;
+int motor_speed;
+long prev_err = 0;
+double dt;
 
 void setup() {
     Serial.begin(115200);
@@ -81,11 +90,16 @@ void loop() {
     // Perform angle update
     loop_start = micros();
     kalman_update(loop_start, acc, gyro);
-    Serial.print("Angle: ");
+    dt = (double)((micros() - loop_start)/1.0e6);
+    theta_goal = map(analogRead(SLIDE_TRIMMER), 0, 1023, MIN_ANGLE*100, MAX_ANGLE*100) / 100.0;
+    prev_err = pid(prev_err, dt);
+    driveMotor(motor_speed);
+    Serial.print("Goal angle: ");
+    Serial.print(theta_goal);
+    Serial.print(" deg | Current angle: ");
     Serial.print(theta_kalman);
-    Serial.println(" deg");
-    int slide = analogRead(SLIDE_TRIMMER);
-    driveMotor(slide < 512 ? map(slide, 0, 511, -255, -50) : map(slide, 512, 1023, 50, 255));
+    Serial.print(" deg | Motor speed: ");
+    Serial.println(motor_speed);
 }
 
 /* ===========================
@@ -155,9 +169,10 @@ void calibrateMPU6500(uint16_t samples) {
     long gyro_data[samples][3];
     long gyro_sum[3];
     int16_t g[3] = {0, 0, 0};
-
+    int next = 100;
     // Take samples and record data
     for(int i = 0; i < samples; i++) {
+        driveMotor(next);
         readRawAccelGyro(a, g);
         for(int j = 0; j < 3; j++) {
             acc_data[i][j] = a[j];
@@ -166,6 +181,8 @@ void calibrateMPU6500(uint16_t samples) {
             gyro_data[i][j] = g[j];
             gyro_sum[j] += g[j];
         }
+        next = -1 * next;
+        delay(100);
     }
 
     // Compute means
@@ -192,13 +209,13 @@ void calibrateMPU6500(uint16_t samples) {
 }
 
 bool pwm_valid(int pwm) {
-    return (abs(pwm) > MIN_PWN && abs(pwm) < MAX_PWM);
+    return (abs(pwm) > MIN_PWM && abs(pwm) < MAX_PWM);
 }
 
 void driveMotor(int pwm) {
     if (pwm == 0) { stop_motor(); return; }
-    if (pwm > 0 && pwm_valid(pwm)) { move_right(pwm); }
-    else if(pwm_valid(pwm)) { move_left(-pwm); } 
+    if (pwm > 0 && pwm_valid(pwm) && !atRightLimit()) { move_right(pwm); }
+    else if(pwm_valid(pwm) && !atLeftLimit()) { move_left(-pwm); } 
 }
 
 double angleAccel(int16_t ay, int16_t az) {
@@ -355,4 +372,38 @@ void kalman_update(unsigned long t0, int16_t* a, int16_t* g) {
     cov = (1 - kalman_gain)*cov;
     // Final output
     theta_kalman = theta_kalman + kalman_gain * (theta_meas - theta_kalman);
+}
+
+long pid(long prev_error, double dt) {
+    long error = (long)((theta_kalman - theta_goal) * 100);
+    double deriv = (error - prev_error) / dt;
+    Serial.println(deriv);
+    int prop_speed;
+    int deriv_speed;
+    // Ccontrol if error is larger that 0.5 degrees
+    if(abs(error) > 50) {
+        // Proportional
+        prop_speed = map(abs(error), 0, (long)(MAX_ANGLE - MIN_ANGLE)*100, MIN_PWM, MAX_PWM);
+
+        // Derivative
+        if(deriv > 0) { deriv_speed = MAX_PWM; }
+        else {
+            if(deriv < -600000) { deriv = -600000; }
+            deriv_speed = (deriv, -600000, 0, 0, 255);
+        }
+        
+    } else { 
+        prop_speed = 0;
+        deriv_speed = 0;
+    }
+
+    // Correct for direction
+    if(error > 0) { 
+        prop_speed = prop_speed * -1;
+        deriv_speed = deriv_speed * -1;
+    }
+
+    motor_speed = Kp*prop_speed + Kd*deriv_speed;
+
+    return error;
 }
