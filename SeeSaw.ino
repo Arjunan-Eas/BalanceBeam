@@ -81,8 +81,9 @@ void loop() {
     // Perform angle update
     loop_start = micros();
     kalman_update(loop_start, acc, gyro);
-    Serial.print("Angle error (kalman - pot): ");
-    Serial.println(theta_kalman - measureAnglePot());
+    Serial.print("Angle: ");
+    Serial.print(theta_kalman);
+    Serial.println(" deg");
     int slide = analogRead(SLIDE_TRIMMER);
     driveMotor(slide < 512 ? map(slide, 0, 511, -255, -50) : map(slide, 512, 1023, 50, 255));
 }
