@@ -40,7 +40,7 @@ double gyroOffsets[6]  = {0,0,0,0,0,0};
 
 /* Min/Max constants */
 const int MAX_PWM = 255;
-const int MIN_PWM = 100;
+const int MIN_PWM = 80;
 double MAX_ANGLE = 0.0;
 double MIN_ANGLE = 0.0;
 int MAX_POT = 0;
@@ -55,13 +55,28 @@ int16_t acc[3] = {0, 0, 0};
 int16_t gyro[3] = {0, 0, 0};
 
 /* PID */
-float Kp = 0.2;
-float Kd = 0.8;
-float Ki = 0.0;
+// Gains (units): Kp [PWM/deg], Kd [PWM/(deg/s)], Ki [PWM/(deg*s)]
+float Kp = 7.0f;
+float Kd = 0.7f;      // positive, since we subtract the rate term below
+float Ki = 10.0f;      // start small; see tuning notes
+
+// Derivative filter (seconds)
+double D_tau = 0.05;   // 50 ms low-pass on gyro rate
+
+// Integral state and limits
+double I_state = 0.0;          // integrates error
+double I_leak_tau = 0;       // seconds; set 0 to disable leak
+double I_max_pwm = 255.0;      // clamp Ki*I_state within ±I_max_pwm
+
 double theta_goal;
 int motor_speed;
-long prev_err = 0;
+long prev_angle;
 double dt;
+const long MAX_DERIVATIVE = 6000;
+long max_der = 0;
+long min_der = 0;
+
+String inputString = "";
 
 void setup() {
     Serial.begin(115200);
@@ -89,10 +104,9 @@ void setup() {
 void loop() {
     // Perform angle update
     loop_start = micros();
-    kalman_update(loop_start, acc, gyro);
-    dt = (double)((micros() - loop_start)/1.0e6);
+    dt = kalman_update(loop_start, acc, gyro);
     theta_goal = map(analogRead(SLIDE_TRIMMER), 0, 1023, MIN_ANGLE*100, MAX_ANGLE*100) / 100.0;
-    prev_err = pid(prev_err, dt);
+    pid(dt, gyro[0]);
     driveMotor(motor_speed);
     Serial.print("Goal angle: ");
     Serial.print(theta_goal);
@@ -100,6 +114,21 @@ void loop() {
     Serial.print(theta_kalman);
     Serial.print(" deg | Motor speed: ");
     Serial.println(motor_speed);
+
+    if (Serial.available()) {
+        char inChar = (char)Serial.read();
+        
+        // End of line marks full command
+        if (inChar == '\n' || inChar == '\r') {
+        if (inputString.length() > 0) {
+            parseCommand(inputString);
+            inputString = ""; // reset
+        }
+        } else {
+        inputString += inChar;
+        }
+    }
+
 }
 
 /* ===========================
@@ -208,14 +237,21 @@ void calibrateMPU6500(uint16_t samples) {
     }
 }
 
-bool pwm_valid(int pwm) {
-    return (abs(pwm) > MIN_PWM && abs(pwm) < MAX_PWM);
+int pwm_valid(int pwm) {
+    if(abs(pwm) > MIN_PWM && abs(pwm) < MAX_PWM) { return 0; }
+    else {
+        if(pwm > MAX_PWM) { return MAX_PWM; }
+        else if(pwm < (-1*MAX_PWM)) { return -1*MAX_PWM; }
+        else if(pwm > 0 && pwm < MIN_PWM) { return MIN_PWM; }
+        else if(pwm < 0 && pwm > (-1*MIN_PWM)) { return -1*MIN_PWM; }
+        else if(pwm == 0) { return 0; }
+    }
 }
 
 void driveMotor(int pwm) {
     if (pwm == 0) { stop_motor(); return; }
-    if (pwm > 0 && pwm_valid(pwm) && !atRightLimit()) { move_right(pwm); }
-    else if(pwm_valid(pwm) && !atLeftLimit()) { move_left(-pwm); } 
+    if (pwm > 0 && (pwm_valid(pwm) == 0) && !atRightLimit()) { move_right(pwm); }
+    else if((pwm_valid(pwm) == 0) && !atLeftLimit()) { move_left(-pwm); } 
 }
 
 double angleAccel(int16_t ay, int16_t az) {
@@ -346,10 +382,11 @@ void pot_variance() {
         pot_var += pow((pot_angle[i] - pot_mean), 2);
     }
     
-    pot_var = pot_var / 10;    
+    pot_var = pot_var / 10;
+    prev_angle = MAX_ANGLE;
 }
 
-void kalman_update(unsigned long t0, int16_t* a, int16_t* g) {
+double kalman_update(unsigned long t0, int16_t* a, int16_t* g) {
     readRawAccelGyro(a, g);
     double dt = (micros() - t0)/1.0e6;
     // Predict
@@ -372,38 +409,121 @@ void kalman_update(unsigned long t0, int16_t* a, int16_t* g) {
     cov = (1 - kalman_gain)*cov;
     // Final output
     theta_kalman = theta_kalman + kalman_gain * (theta_meas - theta_kalman);
+    
+    return dt;
 }
 
-long pid(long prev_error, double dt) {
-    long error = (long)((theta_kalman - theta_goal) * 100);
-    double deriv = (error - prev_error) / dt;
-    Serial.println(deriv);
-    int prop_speed;
-    int deriv_speed;
-    // Ccontrol if error is larger that 0.5 degrees
-    if(abs(error) > 50) {
-        // Proportional
-        prop_speed = map(abs(error), 0, (long)(MAX_ANGLE - MIN_ANGLE)*100, MIN_PWM, MAX_PWM);
+void pid(double dt, int16_t gx) {
+  // 1) Error: setpoint - measurement
+  double e = theta_goal - theta_kalman;
 
-        // Derivative
-        if(deriv > 0) { deriv_speed = MAX_PWM; }
-        else {
-            if(deriv < -600000) { deriv = -600000; }
-            deriv_speed = (deriv, -600000, 0, 0, 255);
-        }
-        
-    } else { 
-        prop_speed = 0;
-        deriv_speed = 0;
-    }
+  // 2) Derivative from gyro (deg/s), low-pass filtered
+  static double theta_dot_f = 0.0;
+  double theta_dot = (double)gx / GYRO_SCALE;      // deg/s
+  double alpha = dt / (D_tau + dt);
+  theta_dot_f += alpha * (theta_dot - theta_dot_f);
 
-    // Correct for direction
-    if(error > 0) { 
-        prop_speed = prop_speed * -1;
-        deriv_speed = deriv_speed * -1;
-    }
+  // 3) Leaky integrator (bleed toward 0 to avoid long-term windup)
+  if (I_leak_tau > 0.0) {
+    double leak = dt / I_leak_tau;
+    if (leak > 1.0) leak = 1.0;
+    I_state *= (1.0 - leak);
+  }
 
-    motor_speed = Kp*prop_speed + Kd*deriv_speed;
+  // ---------- Exponential boost for persistent small error ----------
+  // Counts time only while |e| is small (stuck near target) and the sign is stable.
+  static double persist_t = 0.0;
+  static double e_prev = 0.0;
+  const double E_PERSIST_MIN = 0.15;  // deg: ignore pure noise below this
+  const double E_PERSIST_MAX = 6.0;   // deg: don't "boost" when far away
+  const double I_BOOST_RATE = 7;    // 1/s: growth rate for exp() (tune 0.3–1.0)
+  const double I_BOOST_MAX  = 50;   // cap on the boost factor (tune 5–20)
 
-    return error;
+  bool small_and_stable =
+      (fabs(e) >= E_PERSIST_MIN) &&
+      (fabs(e) <= E_PERSIST_MAX) &&
+      (e * e_prev > 0.0);     // same sign as last loop
+
+  if (small_and_stable) {
+    persist_t += dt;          // accumulate persistence time
+  } else {
+    persist_t = 0.0;          // reset if large jump, sign flip, or too small/large
+  }
+
+  double I_boost = exp(I_BOOST_RATE * persist_t);
+  if (I_boost > I_BOOST_MAX) I_boost = I_BOOST_MAX;
+  // -----------------------------------------------------------------
+
+  // 4) Conditional integration (anti-windup)
+  double u_pd  = Kp * e - Kd * theta_dot_f;
+  double u_pred = u_pd + Ki * I_state;
+
+  bool will_saturate_hi = (u_pred >  (MAX_PWM - 1));
+  bool will_saturate_lo = (u_pred < -(MAX_PWM - 1));
+
+  bool integrate = true;
+  if (will_saturate_hi && e > 0) integrate = false;
+  if (will_saturate_lo && e < 0) integrate = false;
+
+  if (integrate) {
+    // Exponentially accelerated integration when small error persists
+    I_state += (I_boost * e * dt);   // deg*s scaled by boost
+  }
+
+  // Clamp integral so its contribution stays bounded
+  double I_term = Ki * I_state;
+//   if (I_term >  I_max_pwm) { I_term =  I_max_pwm; I_state = I_max_pwm / Ki; }
+//   if (I_term < -I_max_pwm) { I_term = -I_max_pwm; I_state = -I_max_pwm / Ki; }
+
+  // 5) Raw command
+  double u = u_pd + I_term;
+  Serial.println(u);
+
+  // 6) Small deadband → zero (don’t snap to ±MIN)
+  if (fabs(u) < MIN_PWM) u = 0.0;
+
+  // 7) Saturate to driver limits (inside valid range)
+  if (u >  (MAX_PWM - 1)) u =  (MAX_PWM - 1);
+  if (u < -(MAX_PWM - 1)) u = -(MAX_PWM - 1);
+
+  // Optional: reset integral if we slam a limit switch
+  if (atLeftLimit() || atRightLimit()) {
+    I_state = 0.0;
+    persist_t = 0.0;  // also reset persistence timer
+  }
+
+  motor_speed = (int)u;
+  e_prev = e;  // update after using it
+}
+
+
+
+
+void parseCommand(String command) {
+  command.trim();  // remove whitespace
+  
+  int eqIndex = command.indexOf('=');
+  if (eqIndex == -1) return; // no '=' found
+  
+  String key = command.substring(0, eqIndex);
+  String valueStr = command.substring(eqIndex + 1);
+  
+  float value = valueStr.toFloat();
+  
+  if (key == "Kp") {
+    Kp = value;
+    Serial.print("Set Kp = ");
+    Serial.println(Kp);
+  } else if (key == "Kd") {
+    Kd = value;
+    Serial.print("Set Kd = ");
+    Serial.println(Kd);
+  } else if (key == "Ki" || key == "ki") {
+    Ki = value;
+    Serial.print("Set Ki = ");
+    Serial.println(Ki);
+  } else {
+    Serial.print("Unknown key: ");
+    Serial.println(key);
+  }
 }
